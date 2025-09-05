@@ -2,10 +2,10 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Optional
 
 import aiohttp
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -20,162 +20,95 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID", "")
 OZON_API_KEY = os.getenv("OZON_API_KEY", "")
 
-# Что мониторить: списки через запятую (необязательны)
-MONITOR_OFFER_IDS = [x.strip() for x in os.getenv("MONITOR_OFFER_IDS", "").split(",") if x.strip()]
-MONITOR_PRODUCT_IDS = [int(x) for x in os.getenv("MONITOR_PRODUCT_IDS", "").split(",") if x.strip()]
+# список юнитов для мониторинга (через .env)
+WATCH_OFFERS = [s.strip() for s in os.getenv("WATCH_OFFERS", "").split(",") if s.strip()]
+WATCH_PRODUCTS = [int(s) for s in os.getenv("WATCH_PRODUCTS", "").split(",") if s.strip().isdigit()]
 
-# Порог «тишины»
-HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "180"))
+# пороги/настройки
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "180"))  # 3 часа
 HEARTBEAT_CHAT_ID = int(os.getenv("HEARTBEAT_CHAT_ID", ADMIN_IDS[0] if ADMIN_IDS else "0"))
+
+POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "300"))      # 5 минут
+CHANGE_CONFIRMS = int(os.getenv("CHANGE_CONFIRMS", "2"))        # сколькими циклами подтвердить
+PRICE_TOLERANCE = int(os.getenv("PRICE_TOLERANCE", "1"))        # «погрешность» в рублях
 
 # -------------------- BOT/DP --------------------
 bot = Bot(token=TG_TOKEN, default_parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # -------------------- Состояние --------------------
-last_activity: datetime = datetime.now()      # последняя любая активность
-last_cycle_at: Optional[datetime] = None      # последний удачный цикл мониторинга
-previous_prices: Dict[str, int] = {}          # кэш цен (ключ — offer_id)
-STARTED_AT = datetime.now()
+last_activity: datetime = datetime.now()
+last_cycle_at: Optional[datetime] = None
+last_alert_at: Optional[datetime] = None
 
-# -------------------- Утилиты --------------------
+class PriceState:
+    __slots__ = ("price", "confirm", "last_seen")
+    def __init__(self, price: int):
+        self.price = price
+        self.confirm = 0
+        self.last_seen = datetime.now()
+
+# k: offer_id -> PriceState
+buyer_prices: Dict[str, PriceState] = {}
+no_marketing_now: int = 0
+
 def touch_alive(note: str = "") -> None:
     global last_activity
     last_activity = datetime.now()
     if note:
-        log.debug("touch: %s", note)
-
-def pick_buyer_price(item: dict) -> Tuple[int, int, int]:
-    """
-    Возвращаем (price, old_price, discount_percent) для покупателя.
-    В ответах Seller API свежая цена для покупателя хранится в 'price.marketing_price' (если >0),
-    иначе используем 'price.price'. old_price — 'price.old_price'.
-    """
-    p = item.get("price", {}) if isinstance(item.get("price"), dict) else {}
-    marketing_price = _to_int(p.get("marketing_price"))
-    regular_price   = _to_int(p.get("price"))
-    old_price       = _to_int(p.get("old_price"))
-    price = marketing_price if marketing_price > 0 else regular_price
-    discount = max(old_price - price, 0) if old_price and price else 0
-    discount_pct = int(round(discount * 100 / old_price)) if old_price else 0
-    return price, old_price, discount_pct
-
-def _to_int(v) -> int:
-    try:
-        if v is None: return 0
-        if isinstance(v, (int, float)): return int(round(v))
-        return int(round(float(str(v).replace(",", "."))))
-    except Exception:
-        return 0
-
-def chunks(lines: List[str], max_len: int = 4000) -> List[str]:
-    """Разбиваем список строк на куски по лимиту Telegram."""
-    blocks, cur = [], ""
-    for line in lines:
-        if len(cur) + len(line) + 1 > max_len:
-            blocks.append(cur)
-            cur = ""
-        cur += line + "\n"
-    if cur:
-        blocks.append(cur)
-    return blocks
-
-def human_health(now: datetime) -> Tuple[str, str]:
-    """Вернём (статус_тишины, текст_последнего_цикла)."""
-    silence_td = now - last_activity
-    threshold = timedelta(minutes=HEARTBEAT_MINUTES)
-
-    if silence_td <= threshold:
-        hb = "OK"
-    elif silence_td <= threshold + timedelta(minutes=HEARTBEAT_MINUTES):
-        hb = "WARN"
-    else:
-        hb = "SILENT"
-
-    if last_cycle_at:
-        minutes = int((now - last_cycle_at).total_seconds() // 60)
-        last_text = f"{minutes} мин назад"
-    else:
-        last_text = "никогда"
-    return hb, last_text
-
-def format_price_line(title: str, product_id: int, price: int, old_price: int, discount_pct: int) -> str:
-    """
-    Красивый пункт отчёта:
-    • <b>название</b> (ID 123): 327 ₽ — скидка 1 372 ₽ (81%)
-    """
-    if old_price and price and old_price > price:
-        discount_abs = old_price - price
-        return f"• {title}: {price} ₽"
-    return f"• <b>{title}</b> (ID {product_id}): {price} ₽"
-
-def filter_to_monitored(items: List[dict]) -> List[dict]:
-    """
-    Оставляем только то, что прописано в .env.
-    Если списки пустые — вернём исходный список (мониторим всё).
-    """
-    if not MONITOR_OFFER_IDS and not MONITOR_PRODUCT_IDS:
-        return items
-    out = []
-    for it in items:
-        offer = str(it.get("offer_id") or "")
-        pid = it.get("product_id")
-        if (MONITOR_OFFER_IDS and offer in MONITOR_OFFER_IDS) or (MONITOR_PRODUCT_IDS and pid in MONITOR_PRODUCT_IDS):
-            out.append(it)
-    return out
+        log.debug("alive: %s", note)
 
 # -------------------- Ozon Seller API --------------------
 async def get_ozon_products(limit: int = 100) -> List[dict]:
-    """
-    Получаем (offer_id, product_id, name) — пригодится для заголовков.
-    """
+    """Возвращает items с offer_id/product_id, с фильтром по WATCH_* если задан."""
     url = "https://api-seller.ozon.ru/v3/product/list"
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
+    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
 
     all_items: List[dict] = []
     offset = 0
+
     async with aiohttp.ClientSession() as session:
         while True:
             payload = {"filter": {"visibility": "ALL"}, "limit": limit, "offset": offset}
             async with session.post(url, headers=headers, json=payload) as resp:
-                text = await resp.text()
                 if resp.status != 200:
+                    text = await resp.text()
                     log.error("products %s: %s", resp.status, text)
-                    return []
+                    break
                 data = await resp.json()
-                items = data.get("result", {}).get("items", []) or []
+                items = data.get("result", {}).get("items", [])
                 if not items:
                     break
+
+                if WATCH_OFFERS or WATCH_PRODUCTS:
+                    items = [
+                        it for it in items
+                        if (not WATCH_OFFERS or it.get("offer_id") in WATCH_OFFERS)
+                        and (not WATCH_PRODUCTS or it.get("product_id") in WATCH_PRODUCTS)
+                    ]
+
                 all_items.extend(items)
-                offset += len(items)
                 if len(items) < limit:
                     break
+                offset += limit
+
     touch_alive("ozon_products")
     return all_items
 
+
 async def get_ozon_prices(offer_ids: List[str], product_ids: List[int]) -> Optional[dict]:
-    """
-    Возвращаем структуру цен с блоком price: {price, old_price, marketing_price}.
-    """
+    """v5/product/info/prices — берём только marketing_price как «цену для покупателя»."""
+    if not offer_ids and not product_ids:
+        return {"items": []}
+
     url = "https://api-seller.ozon.ru/v5/product/info/prices"
-    headers = {
-        "Client-Id": OZON_CLIENT_ID,
-        "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
+    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {
         "cursor": "",
-        "filter": {
-            "offer_id": offer_ids,
-            "product_id": product_ids,
-            "visibility": "ALL",
-        },
+        "filter": {"offer_id": offer_ids, "product_id": product_ids, "visibility": "ALL"},
         "limit": 100,
     }
+
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=payload) as resp:
             text = await resp.text()
@@ -183,172 +116,188 @@ async def get_ozon_prices(offer_ids: List[str], product_ids: List[int]) -> Optio
                 log.error("prices %s: %s", resp.status, text)
                 return None
             data = await resp.json()
-    touch_alive("ozon_prices")
-    return data
+            touch_alive("ozon_prices")
+            return data
+
+def pick_buyer_price(item: dict) -> Optional[int]:
+    """Цена для покупателя — строго marketing_price; если нет/0 — вернём None."""
+    p = item.get("price") or {}
+    mp = p.get("marketing_price")
+    try:
+        mp = int(mp) if mp is not None else None
+    except Exception:
+        mp = None
+    return mp if mp and mp > 0 else None
+
+def arrow(old: int, new: int) -> str:
+    return "↑" if new > old else "↓"
 
 # -------------------- Команды --------------------
+HELP_TEXT = (
+    "Привет! Я показываю цены для покупателя (с учётом маркетинговых скидок).\n\n"
+    "Команды:\n"
+    "/prices — текущие цены\n"
+    "/monitor — включить мониторинг (уведомлю об изменениях)\n"
+    "/health — состояние бота и мониторинга"
+)
+
 @dp.message(Command("start"))
-async def start_cmd(message: Message):
-    text = (
-        "Привет! Я покажу цены для покупателя.\n\n"
-        "Команды:\n"
-        "• /prices — текущие цены\n"
-        "• /monitor — что мониторим\n"
-        "• /health — состояние бота\n"
-    )
-    await message.answer(text)
+async def cmd_start(message: Message):
+    await message.answer(HELP_TEXT)
     touch_alive("cmd_start")
 
 @dp.message(Command("prices"))
-async def prices_cmd(message: Message):
-    # 1) список товаров
+async def cmd_prices(message: Message):
     products = await get_ozon_products()
     if not products:
-        await message.answer("Не удалось получить список товаров с Ozon.")
+        await message.answer("Не удалось получить список товаров.")
         return
 
-    # оставим только нужные из .env (если заданы)
-    products = filter_to_monitored(products)
-
-    # 2) цены
     offer_ids = [it.get("offer_id") for it in products if it.get("offer_id")]
     product_ids = [it.get("product_id") for it in products if it.get("product_id")]
 
-    prices = await get_ozon_prices(offer_ids, product_ids)
-    if not prices:
-        await message.answer("Ошибка при запросе цен к Ozon API.")
+    data = await get_ozon_prices(offer_ids, product_ids)
+    if not data:
+        await message.answer("Ошибка при запросе цен.")
         return
-
-    # 3) сопоставим, чтобы доставать название
-    # product.list не отдаёт name, поэтому используем offer_id как «название»
-    # (если у вас есть маппинг offer_id -> title, можно подложить его здесь)
-    price_items = prices.get("items", []) or []
-    by_key = {(str(i.get("offer_id")), int(i.get("product_id") or 0)): i for i in price_items}
 
     lines = ["Текущие цены для покупателя:"]
-    for it in products:
-        offer = str(it.get("offer_id"))
-        pid = int(it.get("product_id") or 0)
-        src = by_key.get((offer, pid))
-        if not src:
-            continue
-        price, old_price, pct = pick_buyer_price(src)
-        title = offer  # если нужно красивее — замените на свой словарь названий
-        lines.append(format_price_line(title, pid, price, old_price, pct))
+    miss = 0
+    for it in data.get("items", []):
+        offer = it.get("offer_id")  # используем как «читаемое имя»
+        buyer = pick_buyer_price(it)
+        if buyer is None:
+            miss += 1
+            lines.append(f"• {offer}: — (нет маркетинговой цены)")
+        else:
+            lines.append(f"• {offer}: {buyer} ₽")
 
-    for block in chunks(lines):
-        await message.answer(block)
+    lines.append(f"\nНедоступна маркетинговая цена: {miss} шт.")
+    await message.answer("\n".join(lines))
     touch_alive("cmd_prices")
 
-@dp.message(Command("monitor"))
-async def monitor_cmd(message: Message):
-    if not MONITOR_OFFER_IDS and not MONITOR_PRODUCT_IDS:
-        await message.answer("В .env не задано MONITOR_OFFER_IDS или MONITOR_PRODUCT_IDS — мониторю все товары.")
-        return
-    parts = ["Мониторю только следующие юниты:"]
-    if MONITOR_OFFER_IDS:
-        parts.append(f"• offer_id: {', '.join(MONITOR_OFFER_IDS)}")
-    if MONITOR_PRODUCT_IDS:
-        parts.append(f"• product_id: {', '.join(map(str, MONITOR_PRODUCT_IDS))}")
-    await message.answer("\n".join(parts))
-
-@dp.message(Command(commands=["health", "ping"]))
-async def health_cmd(message: Message):
+@dp.message(Command("health"))
+async def cmd_health(message: Message):
     now = datetime.now()
-    hb, last_txt = human_health(now)
-    uptime_min = int((now - STARTED_AT).total_seconds() // 60)
-
-    if MONITOR_OFFER_IDS or MONITOR_PRODUCT_IDS:
-        scope = []
-        if MONITOR_OFFER_IDS:
-            scope.append(f"offer_id ({len(MONITOR_OFFER_IDS)})")
-        if MONITOR_PRODUCT_IDS:
-            scope.append(f"product_id ({len(MONITOR_PRODUCT_IDS)})")
-        scope_txt = ", ".join(scope)
-    else:
-        scope_txt = "все товары"
+    silence = int((now - last_activity).total_seconds() // 60)
+    last_cycle_txt = "-" if not last_cycle_at else f"{int((now - last_cycle_at).total_seconds() // 60)} мин назад"
+    last_alert_txt = "-" if not last_alert_at else f"{int((now - last_alert_at).total_seconds() // 60)} мин назад"
 
     text = (
-        "Состояние бота\n"
-        f"• Пульс: {hb} (порог {HEARTBEAT_MINUTES} мин)\n"
-        f"• Последний успешный цикл: {last_txt}\n"
-        f"• Аптайм: {uptime_min} мин\n"
-        f"• Мониторинг: {scope_txt}\n"
-        f"• Админы: {', '.join(map(str, ADMIN_IDS)) or '—'}"
+        "Состояние:\n"
+        f"• Тишина: {silence} мин (порог {HEARTBEAT_MINUTES})\n"
+        f"• Последний цикл: {last_cycle_txt}\n"
+        f"• Последнее уведомление: {last_alert_txt}\n"
+        f"• В кэше цен: {len(buyer_prices)} офферов\n"
+        f"• Сейчас без marketing_price: {no_marketing_now}"
     )
     await message.answer(text)
     touch_alive("cmd_health")
 
-# -------------------- Периодическая проверка цен --------------------
+@dp.message(Command("monitor"))
+async def cmd_monitor(message: Message):
+    await message.answer("Мониторинг уже работает в фоне. Сообщу, если цена для покупателя изменится устойчиво.")
+    touch_alive("cmd_monitor")
+
+# ---------- дружелюбный ответ на любое обычное сообщение ----------
+@dp.message(F.text & ~F.text.startswith("/"))
+async def greet_any_text(message: Message):
+    await message.answer(HELP_TEXT)
+    touch_alive("greet_any")
+
+# -------------------- Мониторинг --------------------
 async def check_prices_periodically():
-    global last_cycle_at, previous_prices
+    """Следим только за marketing_price. Оповещаем сразу при фактическом изменении."""
+    global last_cycle_at, last_alert_at, no_marketing_now
+
     while True:
         try:
+            # 1) Берём список отслеживаемых товаров
             products = await get_ozon_products()
-            if not products:
-                await asyncio.sleep(60)
-                continue
-
-            products = filter_to_monitored(products)
-
             offer_ids = [it.get("offer_id") for it in products if it.get("offer_id")]
             product_ids = [it.get("product_id") for it in products if it.get("product_id")]
 
-            prices = await get_ozon_prices(offer_ids, product_ids)
-            if not prices:
-                await asyncio.sleep(60)
+            # 2) Тянем цены
+            data = await get_ozon_prices(offer_ids, product_ids)
+            if not data:
+                await asyncio.sleep(POLL_PERIOD_SEC)
                 continue
 
-            for it in prices.get("items", []) or []:
-                offer = str(it.get("offer_id") or "")
-                price, _, _ = pick_buyer_price(it)
-                old = previous_prices.get(offer)
-                if old is not None and old != price:
-                    diff = "↑" if price > old else "↓"
-                    txt = f"Цена изменилась по {offer}: {old} → {price} ₽ {diff}"
-                    for admin in ADMIN_IDS:
-                        try:
-                            await bot.send_message(admin, txt)
-                        except Exception as e:
-                            log.warning("send admin %s failed: %s", admin, e)
-                previous_prices[offer] = price
+            # 3) Собираем наблюдения по marketing_price
+            no_marketing_now = 0
+            observed: Dict[str, int] = {}
+            for it in data.get("items", []):
+                offer = it.get("offer_id")
+                buyer = pick_buyer_price(it)  # только marketing_price (>0), иначе None
+                if buyer is None:
+                    no_marketing_now += 1
+                    continue
+                observed[offer] = buyer
+
+            # 4) Вычисляем изменения (без дебаунса/толеранса)
+            changes: List[str] = []
+            now = datetime.now()
+
+            for offer, cur_price in observed.items():
+                state = buyer_prices.get(offer)
+
+                # первый раз видим — просто запоминаем
+                if state is None:
+                    buyer_prices[offer] = PriceState(cur_price)
+                    continue
+
+                # обновляем метку последнего наблюдения
+                state.last_seen = now
+
+                # если цена реально изменилась — фиксируем и сообщаем
+                if cur_price != state.price:
+                    prev = state.price
+                    state.price = cur_price
+                    # формируем красивую строку-элемент списка
+                    changes.append(f"• {offer}: {prev} ₽ → {cur_price} ₽ {arrow(prev, cur_price)}")
+
+            # 5) Отправляем единым сообщением
+            if changes:
+                last_alert_at = datetime.now()
+                text = "Цены изменились по следующим товарам:\n" + "\n".join(changes)
+                for admin in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin, text)
+                    except Exception as e:
+                        log.warning("send to %s failed: %s", admin, e)
 
             last_cycle_at = datetime.now()
             touch_alive("cycle_ok")
+
         except Exception as e:
             log.exception("periodic error: %s", e)
 
-        await asyncio.sleep(300)  # каждые 5 минут
+        await asyncio.sleep(POLL_PERIOD_SEC)
 
-# -------------------- Heartbeat-монитор --------------------
+# -------------------- Heartbeat --------------------
 async def heartbeat_watcher():
-    if not HEARTBEAT_CHAT_ID:
-        log.warning("HEARTBEAT_CHAT_ID not set — heartbeat-тихий режим.")
-        return
+    global last_activity
     threshold = timedelta(minutes=HEARTBEAT_MINUTES)
+    if not HEARTBEAT_CHAT_ID:
+        log.warning("HEARTBEAT_CHAT_ID not set — heartbeat тихий.")
+        return
+
     while True:
         try:
-            if datetime.now() - last_activity > threshold:
+            silence = datetime.now() - last_activity
+            if silence > threshold:
                 try:
-                    mins = int((datetime.now() - last_activity).total_seconds() // 60)
                     await bot.send_message(
                         HEARTBEAT_CHAT_ID,
-                        f"⚠️ Тишина: нет активности {mins} мин (порог {HEARTBEAT_MINUTES})."
+                        f"⚠️ Тишина: нет активности {int(silence.total_seconds() // 60)} мин (порог {HEARTBEAT_MINUTES})."
                     )
                 except Exception as e:
-                    log.warning("send heartbeat alert failed: %s", e)
+                    log.warning("heartbeat send failed: %s", e)
                 touch_alive("heartbeat_alert")
         except Exception as e:
             log.error("heartbeat error: %s", e)
-        await asyncio.sleep(60)
 
-# -------------------- Обработка прочих сообщений --------------------
-@dp.message()
-async def any_message(msg: Message):
-    touch_alive("incoming")
-    # Неброское приветствие по любому слову (без эха команд):
-    if not (isinstance(msg.text, str) and msg.text.strip().startswith("/")):
-        await msg.answer("Привет! Команды: /start, /prices, /monitor, /health")
+        await asyncio.sleep(60)
 
 # -------------------- ENTRYPOINT --------------------
 async def main():
